@@ -1,0 +1,12 @@
+{
+    "author": "Mohammed Rizwan",
+    "description": "Send and Receive for Unity",
+    "displayName": "Artnet-Unity",
+    "keywords": [ "Artnet" ],
+    "license": "Unlicense",
+    "name": "com.rizwan.artnet",
+    "repository": "github:Risu-swift/Risu-swift/ArtNet.Unity",
+    "unity": "6000.1",
+    "unityRelease": "10f1",
+    "version": "0.0.1"
+}
