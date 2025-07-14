@@ -21,6 +21,9 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     public float batchSendRate = 30f; // How often to send batched data
     public bool enableBatchedSending = true;
     
+    [Header("Auto Channel Assignment")]
+    public bool autoAssignChannels = true; // Enable automatic channel assignment
+    
     IPEndPoint remote;
 
     [Header("dmx devices")]
@@ -178,12 +181,80 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         if (!registeredDevices.Contains(device))
         {
             registeredDevices.Add(device);
+            
+            // Auto-assign channels if enabled
+            if (autoAssignChannels)
+            {
+                AssignDeviceToUniverse(device);
+            }
         }
     }
     
     public void UnregisterDevice(IDMXDevice device)
     {
         registeredDevices.Remove(device);
+    }
+    
+    // Automatically assign a device to a universe and set its start channel
+    private void AssignDeviceToUniverse(IDMXDevice device)
+    {
+        var dmxDevice = device as DMXDevice;
+        if (dmxDevice == null) return;
+        
+        // Find the first universe that has space for this device
+        foreach (var universe in universes)
+        {
+            if (universe.devices == null) continue;
+            
+            // Calculate current channel usage in this universe
+            int currentChannelCount = 0;
+            var sortedDevices = universe.devices.Where(d => d != null).OrderBy(d => d.StartChannel).ToList();
+            
+            foreach (var existingDevice in sortedDevices)
+            {
+                currentChannelCount = Mathf.Max(currentChannelCount, existingDevice.StartChannel + existingDevice.NumChannels);
+            }
+            
+            // Check if there's space for this device
+            if (currentChannelCount + device.NumChannels <= 512)
+            {
+                // Check if the device is already in this universe
+                bool deviceExists = universe.devices.Contains(dmxDevice);
+                
+                if (!deviceExists)
+                {
+                    // Add device to universe array
+                    var newDevicesList = new List<DMXDevice>(universe.devices ?? new DMXDevice[0]);
+                    newDevicesList.Add(dmxDevice);
+                    universe.devices = newDevicesList.ToArray();
+                }
+                
+                // Set start channel
+                device.StartChannel = currentChannelCount;
+                
+                // Update device name
+                dmxDevice.name = string.Format("{0}:({1},{2:d3}-{3:d3})", 
+                    dmxDevice.GetType().ToString(), 
+                    universe.universe, 
+                    device.StartChannel, 
+                    device.StartChannel + device.NumChannels - 1);
+                
+                Debug.Log($"Auto-assigned device {dmxDevice.name} to universe {universe.universe} starting at channel {device.StartChannel}");
+                return;
+            }
+        }
+        
+        Debug.LogWarning($"Could not auto-assign device {dmxDevice.name} - no universe has enough free channels ({device.NumChannels} needed)");
+    }
+    
+    // Manual method to reassign all channels (useful for reorganizing)
+    [ContextMenu("Reassign All Channels")]
+    public void ReassignAllChannels()
+    {
+        foreach (var universe in universes)
+        {
+            universe.Initialize();
+        }
     }
 
     [ContextMenu("send DMX")]
@@ -251,6 +322,15 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         dmxDataMap = new Dictionary<int, byte[]>();
         universeOutputBuffers = new Dictionary<int, byte[]>();
         universeDirtyFlags = new Dictionary<int, bool>();
+        
+        // Initialize all universes on start
+        if (universes != null)
+        {
+            foreach (var universe in universes)
+            {
+                universe.Initialize();
+            }
+        }
     }
 
     private void OnDestroy()

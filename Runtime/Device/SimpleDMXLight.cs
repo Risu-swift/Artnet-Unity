@@ -84,7 +84,13 @@ public class SimpleDMXLight : DMXDevice
     // This method is called by the data provider to update DMX data from light state
     public void UpdateDMXDataFromLight()
     {
-        if (light != null && dmxData != null && dmxData.Length >= NumChannels)
+        // Ensure dmxData is initialized
+        if (dmxData == null || dmxData.Length != NumChannels)
+        {
+            dmxData = new byte[NumChannels];
+        }
+
+        if (light != null)
         {
             var color = light.color;
             dmxData[0] = (byte)(color.r * 255);
