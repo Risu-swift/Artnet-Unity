@@ -44,6 +44,7 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     private Dictionary<int, bool> universeDirtyFlags = new Dictionary<int, bool>();
     private float lastBatchSendTime;
 
+    public bool newPacket;
     // IDMXCommunicator interface implementations
     public void SendData(IDMXDevice device)
     {
@@ -195,100 +196,26 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         registeredDevices.Remove(device);
     }
     
-    // Automatically assign a device to a universe and set its start channel
-    private void AssignDeviceToUniverse(IDMXDevice device)
+    [Header("Channel Layout")]
+    public IChannelLayoutStrategy layoutStrategy;
+    
+    // Serialized fields for inspector configuration
+    [SerializeField] private LayoutType currentLayoutType = LayoutType.Sequential;
+    [SerializeField] private MatrixChannelLayout matrixLayout = new MatrixChannelLayout();
+    [SerializeField] private SequentialChannelLayout sequentialLayout = new SequentialChannelLayout();
+    
+    public enum LayoutType
     {
-        var dmxDevice = device as DMXDevice;
-        if (dmxDevice == null) return;
-        
-        // Find the first universe that has space for this device
-        foreach (var universe in universes)
-        {
-            if (universe.devices == null) continue;
-            
-            // Calculate current channel usage in this universe
-            int currentChannelCount = 0;
-            var sortedDevices = universe.devices.Where(d => d != null).OrderBy(d => d.StartChannel).ToList();
-            
-            foreach (var existingDevice in sortedDevices)
-            {
-                currentChannelCount = Mathf.Max(currentChannelCount, existingDevice.StartChannel + existingDevice.NumChannels);
-            }
-            
-            // Check if there's space for this device
-            if (currentChannelCount + device.NumChannels <= 512)
-            {
-                // Check if the device is already in this universe
-                bool deviceExists = universe.devices.Contains(dmxDevice);
-                
-                if (!deviceExists)
-                {
-                    // Add device to universe array
-                    var newDevicesList = new List<DMXDevice>(universe.devices ?? new DMXDevice[0]);
-                    newDevicesList.Add(dmxDevice);
-                    universe.devices = newDevicesList.ToArray();
-                }
-                
-                // Set start channel
-                device.StartChannel = currentChannelCount;
-                
-                // Update device name
-                dmxDevice.name = string.Format("{0}:({1},{2:d3}-{3:d3})", 
-                    dmxDevice.GetType().ToString(), 
-                    universe.universe, 
-                    device.StartChannel, 
-                    device.StartChannel + device.NumChannels - 1);
-                
-                Debug.Log($"Auto-assigned device {dmxDevice.name} to universe {universe.universe} starting at channel {device.StartChannel}");
-                return;
-            }
-        }
-        
-        Debug.LogWarning($"Could not auto-assign device {dmxDevice.name} - no universe has enough free channels ({device.NumChannels} needed)");
+        Sequential,
+        Matrix,
+        Drawn
     }
     
-    // Manual method to reassign all channels (useful for reorganizing)
-    [ContextMenu("Reassign All Channels")]
-    public void ReassignAllChannels()
-    {
-        foreach (var universe in universes)
-        {
-            universe.Initialize();
-        }
-    }
-
-    [ContextMenu("send DMX")]
-    public void Send()
-    {
-        if (useBroadcast && isServer)
-            artnet.Send(dmxToSend);
-        else
-            artnet.Send(dmxToSend, remote);
-    }
-    
-    public void Send(short universe, byte[] dmxData)
-    {
-        dmxToSend.Universe = universe;
-        System.Buffer.BlockCopy(dmxData, 0, dmxToSend.DmxData, 0, dmxData.Length);
-
-        if (useBroadcast && isServer)
-            artnet.Send(dmxToSend);
-        else
-            artnet.Send(dmxToSend, remote);
-    }
-
-    private void OnValidate()
-    {
-        if (universes != null)
-        {
-            foreach (var u in universes)
-                u.Initialize();
-        }
-    }
-
-    public bool newPacket;
     void Start()
     {
+        // Initialize layout strategy based on selection
+        UpdateLayoutStrategy();
+        
         artnet = new ArtNetSocket();
         if (isServer)
             artnet.Open(FindFromHostName("localhost"), null);
@@ -332,6 +259,108 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
             }
         }
     }
+    
+    [SerializeField] private DrawnChannelLayout drawnLayout = new DrawnChannelLayout();
+    
+    private void UpdateLayoutStrategy()
+    {
+        switch (currentLayoutType)
+        {
+            case LayoutType.Sequential:
+                layoutStrategy = sequentialLayout;
+                break;
+            case LayoutType.Matrix:
+                layoutStrategy = matrixLayout;
+                break;
+            case LayoutType.Drawn:
+                layoutStrategy = drawnLayout;
+                break;
+        }
+    }
+    
+    // Method to apply drawn layout from the editor window
+    public void ApplyDrawnLayout(DrawnLayoutData layoutData)
+    {
+        drawnLayout.layoutData = layoutData;
+        currentLayoutType = LayoutType.Drawn;
+        UpdateLayoutStrategy();
+        ReassignAllChannels();
+    }
+    
+    // Called when inspector values change
+    private void OnValidate()
+    {
+        UpdateLayoutStrategy();
+        
+        if (universes != null)
+        {
+            foreach (var u in universes)
+            {
+                if (layoutStrategy != null)
+                {
+                    layoutStrategy.AssignChannels(u);
+                }
+                else
+                {
+                    u.Initialize(); // Fallback
+                }
+            }
+        }
+    }
+    
+    // Modified auto-assignment method - now uses only the interface
+    private void AssignDeviceToUniverse(IDMXDevice device)
+    {
+        var dmxDevice = device as DMXDevice;
+        if (dmxDevice == null) return;
+        
+        // Find the first universe that can fit this device
+        foreach (var universe in universes)
+        {
+            if (universe.devices == null) continue;
+            
+            // Use the interface to check if device can fit
+            if (layoutStrategy != null && layoutStrategy.CanFitDevice(universe, device))
+            {
+                // Add device to universe if not already present
+                if (!universe.devices.Contains(dmxDevice))
+                {
+                    var newDevicesList = new List<DMXDevice>(universe.devices ?? new DMXDevice[0]);
+                    newDevicesList.Add(dmxDevice);
+                    universe.devices = newDevicesList.ToArray();
+                }
+                
+                // Use the interface to assign channels
+                layoutStrategy.AssignChannels(universe);
+                
+                Debug.Log($"Auto-assigned device {dmxDevice.name} to universe {universe.universe} using {layoutStrategy.GetLayoutName()}");
+                return;
+            }
+        }
+        
+        string strategyName = layoutStrategy?.GetLayoutName() ?? "No Strategy";
+        Debug.LogWarning($"Could not auto-assign device {dmxDevice.name} using {strategyName}");
+    }
+    
+    // Reassign method - now uses only the interface
+    [ContextMenu("Reassign All Channels")]
+    public void ReassignAllChannels()
+    {
+        if (layoutStrategy == null) return;
+        
+        foreach (var universe in universes)
+        {
+            layoutStrategy.AssignChannels(universe);
+        }
+    }
+    
+    // Method to change layout at runtime
+    public void SetLayoutType(LayoutType type)
+    {
+        currentLayoutType = type;
+        UpdateLayoutStrategy();
+        ReassignAllChannels();
+    }
 
     private void OnDestroy()
     {
@@ -362,6 +391,26 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         {
             SendBatchedData();
         }
+    }
+
+    [ContextMenu("send DMX")]
+    public void Send()
+    {
+        if (useBroadcast && isServer)
+            artnet.Send(dmxToSend);
+        else
+            artnet.Send(dmxToSend, remote);
+    }
+    
+    public void Send(short universe, byte[] dmxData)
+    {
+        dmxToSend.Universe = universe;
+        System.Buffer.BlockCopy(dmxData, 0, dmxToSend.DmxData, 0, dmxData.Length);
+
+        if (useBroadcast && isServer)
+            artnet.Send(dmxToSend);
+        else
+            artnet.Send(dmxToSend, remote);
     }
 
     static IPAddress FindFromHostName(string hostname)
@@ -413,5 +462,94 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
             if (512 < startChannel)
                 Debug.LogErrorFormat("The number({0}) of channels of the universe {1} exceeds the upper limit(512 channels)!", startChannel, universe);
         }
+    }
+    
+    [Header("Gizmo Configuration")]
+    [SerializeField] private bool showUniverseGizmos = true;
+    [SerializeField] private float gizmoTextSize = 1f;
+    [SerializeField] private Vector3 gizmoOffset = new Vector3(0, 2, 0);
+    [SerializeField] private Color universeTextColor = Color.cyan;
+    
+    // Add gizmo drawing methods
+    private void OnDrawGizmos()
+    {
+        if (showUniverseGizmos && universes != null)
+        {
+            DrawUniverseGizmos();
+        }
+    }
+    
+    private void OnDrawGizmosSelected()
+    {
+        if (showUniverseGizmos && universes != null)
+        {
+            DrawUniverseGizmos();
+        }
+    }
+    
+    private void DrawUniverseGizmos()
+    {
+        Vector3 controllerPosition = transform.position + gizmoOffset;
+        
+        // Draw controller info
+        string controllerInfo = $"DMX Controller\nLayout: {layoutStrategy?.GetLayoutName() ?? "None"}";
+        DrawGizmoText(controllerPosition, controllerInfo, universeTextColor);
+        
+        // Draw universe summary
+        for (int i = 0; i < universes.Length; i++)
+        {
+            var universe = universes[i];
+            if (universe.devices == null) continue;
+            
+            Vector3 universePosition = controllerPosition + Vector3.down * (0.5f * gizmoTextSize * (i + 2));
+            string universeInfo = GetUniverseInfo(universe);
+            DrawGizmoText(universePosition, universeInfo, GetUniverseColor(universe));
+        }
+    }
+    
+    private string GetUniverseInfo(UniverseDevices universe)
+    {
+        int deviceCount = universe.devices?.Length ?? 0;
+        int channelCount = GetUniverseChannelCount(universe);
+        
+        return $"Universe {universe.universe}: {deviceCount} devices, {channelCount}/512 channels";
+    }
+    
+    private int GetUniverseChannelCount(UniverseDevices universe)
+    {
+        if (universe.devices == null) return 0;
+        
+        int maxChannel = 0;
+        foreach (var device in universe.devices)
+        {
+            if (device != null)
+            {
+                maxChannel = Mathf.Max(maxChannel, device.StartChannel + device.NumChannels);
+            }
+        }
+        return maxChannel;
+    }
+    
+    private Color GetUniverseColor(UniverseDevices universe)
+    {
+        int channelCount = GetUniverseChannelCount(universe);
+        
+        if (channelCount == 0) return Color.gray;
+        if (channelCount > 512) return Color.red;
+        if (channelCount > 400) return Color.yellow;
+        return Color.green;
+    }
+    
+    private void DrawGizmoText(Vector3 position, string text, Color color)
+    {
+        #if UNITY_EDITOR
+        UnityEditor.Handles.color = color;
+        UnityEditor.Handles.Label(position, text, new GUIStyle()
+        {
+            fontSize = Mathf.RoundToInt(12 * gizmoTextSize),
+            normal = new GUIStyleState() { textColor = color },
+            alignment = TextAnchor.MiddleCenter
+        });
+        #endif
     }
 }

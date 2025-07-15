@@ -13,6 +13,12 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcesso
     [SerializeField] protected bool autoUpdate = true;
     [SerializeField] protected float updateRate = 30f;
     
+    [Header("Gizmo Configuration")]
+    [SerializeField] protected bool showChannelGizmos = true;
+    [SerializeField] protected float gizmoTextSize = 1f;
+    [SerializeField] protected Vector3 gizmoOffset = new Vector3(0, 1, 0);
+    [SerializeField] protected Color gizmoTextColor = Color.white;
+    
     protected IDMXCommunicator communicator;
     protected DMXCommandInvoker commandInvoker;
     protected IDMXDataProvider dataProvider;
@@ -222,5 +228,87 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcesso
             var command = new SetChannelCommand(this, channelMap[ChannelFunction.Dimmer], (byte)(dimmer * 255));
             commandInvoker.ExecuteCommand(command);
         }
+    }
+    
+    // Gizmo drawing methods
+    protected virtual void OnDrawGizmos()
+    {
+        if (showChannelGizmos && Application.isPlaying)
+        {
+            DrawChannelGizmos();
+        }
+    }
+    
+    protected virtual void OnDrawGizmosSelected()
+    {
+        if (showChannelGizmos)
+        {
+            DrawChannelGizmos();
+        }
+    }
+    
+    protected virtual void DrawChannelGizmos()
+    {
+        if (StartChannel <= 0) return;
+        
+        Vector3 position = transform.position + gizmoOffset;
+        
+        // Draw channel range text
+        string channelText = GetChannelDisplayText();
+        DrawGizmoText(position, channelText, gizmoTextColor);
+        
+        // Draw individual channel values if we have data
+        if (dmxData != null && dmxData.Length > 0)
+        {
+            DrawChannelValues(position);
+        }
+    }
+    
+    protected virtual string GetChannelDisplayText()
+    {
+        if (NumChannels == 1)
+        {
+            return $"Ch: {StartChannel}";
+        }
+        else
+        {
+            return $"Ch: {StartChannel}-{StartChannel + NumChannels - 1}";
+        }
+    }
+    
+    protected virtual void DrawChannelValues(Vector3 basePosition)
+    {
+        float lineHeight = 0.3f * gizmoTextSize;
+        
+        for (int i = 0; i < dmxData.Length && i < NumChannels; i++)
+        {
+            Vector3 textPosition = basePosition + Vector3.down * (lineHeight * (i + 1));
+            string channelValue = $"{StartChannel + i}: {dmxData[i]}";
+            
+            // Color code based on value
+            Color valueColor = GetChannelValueColor(dmxData[i]);
+            DrawGizmoText(textPosition, channelValue, valueColor);
+        }
+    }
+    
+    protected virtual Color GetChannelValueColor(byte value)
+    {
+        if (value == 0) return Color.gray;
+        if (value < 64) return Color.red;
+        if (value < 128) return Color.yellow;
+        if (value < 192) return Color.green;
+        return Color.cyan;
+    }
+    
+    protected virtual void DrawGizmoText(Vector3 position, string text, Color color)
+    {
+        #if UNITY_EDITOR
+        UnityEditor.Handles.color = color;
+        UnityEditor.Handles.Label(position, text, new GUIStyle()
+        {
+            fontSize = Mathf.RoundToInt(12 * gizmoTextSize),
+            normal = new GUIStyleState() { textColor = color }
+        });
+        #endif
     }
 }

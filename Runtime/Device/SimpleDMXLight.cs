@@ -27,6 +27,32 @@ public class SimpleDMXLight : DMXDevice
         dataProvider = new SimpleLightDataProvider(this);
     }
 
+    protected override void DrawChannelValues(Vector3 basePosition)
+    {
+        if (dmxData == null || dmxData.Length < 4) return;
+        
+        float lineHeight = 0.3f * gizmoTextSize;
+        string[] channelNames = { "R", "G", "B", "W" };
+        Color[] channelColors = { Color.red, Color.green, Color.blue, Color.white };
+        
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 textPosition = basePosition + Vector3.down * (lineHeight * (i + 1));
+            string channelValue = $"{channelNames[i]}{StartChannel + i}: {dmxData[i]}";
+            
+            // Use channel-specific colors
+            Color valueColor = channelColors[i];
+            if (dmxData[i] == 0) valueColor = Color.gray;
+            
+            DrawGizmoText(textPosition, channelValue, valueColor);
+        }
+    }
+
+    protected override string GetChannelDisplayText()
+    {
+        string deviceName = gameObject.name;
+        return $"{deviceName}\nRGBW: {StartChannel}-{StartChannel + 3}";
+    }
     public override void SetDMXData(byte[] data)
     {
         base.SetDMXData(data);

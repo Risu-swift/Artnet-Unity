@@ -43,3 +43,11 @@ public interface IDMXCommunicator
     void RegisterDevice(IDMXDevice device);
     void UnregisterDevice(IDMXDevice device);
 }
+
+// Channel layout interface for auto-assignment strategies
+public interface IChannelLayoutStrategy
+{
+    void AssignChannels(DmxController.UniverseDevices universe);
+    bool CanFitDevice(DmxController.UniverseDevices universe, IDMXDevice device);
+    string GetLayoutName();
+}
