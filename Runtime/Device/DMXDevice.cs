@@ -1,13 +1,18 @@
 ﻿using UnityEngine;
-using System.Collections.Generic;
-using System.Linq;
 
-public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcessor
+public abstract class DMXDevice : MonoBehaviour, IDMXDevice
 {
+    #region Serialized Fields
+    
     [Header("DMX Configuration")]
-    [SerializeField] protected byte[] dmxData;
-    [SerializeField] protected int startChannel;
+    [SerializeField] protected int startChannel = 0;
     [SerializeField] protected DMXDeviceMode deviceMode = DMXDeviceMode.Input;
+    
+    [Header("Placement Preferences")]
+    [SerializeField] protected int preferredUniverse = 0;
+    [SerializeField] protected int preferredStartChannel = 0;
+    [SerializeField] protected bool allowAutoAssign = true;
+    [SerializeField] protected int placementPriority = 0;
     
     [Header("Output Configuration")]
     [SerializeField] protected bool autoUpdate = true;
@@ -19,218 +24,231 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcesso
     [SerializeField] protected Vector3 gizmoOffset = new Vector3(0, 1, 0);
     [SerializeField] protected Color gizmoTextColor = Color.white;
     
+    [Header("Device Naming")]
+    [SerializeField] private string originalName = "";
+    
+    #endregion
+    
+    #region Private Fields
+    
+    protected byte[] inputData;
+    protected byte[] outputData;
     protected IDMXCommunicator communicator;
-    protected DMXCommandInvoker commandInvoker;
-    protected IDMXDataProvider dataProvider;
-    protected IDMXDataConsumer dataConsumer;
     protected float lastUpdateTime;
+    protected int assignedUniverse = 0;
     
-    // Channel mapping for command pattern
-    protected Dictionary<ChannelFunction, int> channelMap = new Dictionary<ChannelFunction, int>();
+    #endregion
     
-    // IDMXDevice interface implementations
+    #region IDMXDevice Implementation
+    
     public abstract int NumChannels { get; }
-    public int StartChannel { get { return startChannel; } set { startChannel = value; } }
-    public DMXDeviceMode DeviceMode { get { return deviceMode; } }
+    public int StartChannel { get => startChannel; set => startChannel = value; }
+    public DMXDeviceMode DeviceMode => deviceMode;
     
-    public byte[] GetDMXData()
+    public virtual DMXPlacement GetPreferredPlacement()
     {
-        return dmxData;
+        return new DMXPlacement
+        {
+            universe = preferredUniverse,
+            startChannel = preferredStartChannel,
+            autoAssign = allowAutoAssign,
+            priority = placementPriority
+        };
     }
     
-    public virtual void SetDMXData(byte[] data)
+    public virtual void OnPlacementAssigned(int universe, int startChannel)
     {
-        // Only reject external DMX data in Output mode, not internal updates
-        if (deviceMode == DMXDeviceMode.Output)
+        assignedUniverse = universe;
+        this.startChannel = startChannel;
+        
+        Debug.Log($"Device {GetOriginalName()} assigned to Universe {universe}, Channel {startChannel}-{startChannel + NumChannels - 1}");
+        
+        #if UNITY_EDITOR
+        if (Application.isPlaying)
         {
-            // In Output mode, we only accept data updates from internal sources (data providers)
-            // This is called by ReadFromGameObjectCommand, so we need to allow it
-            UpdateInternalDMXData(data);
-            return;
+            UnityEditor.EditorUtility.SetDirty(this);
         }
-            
-        if (data == null)
+        #endif
+    }
+    
+    public byte[] GetInputData() => inputData;
+    public byte[] GetOutputData() => outputData;
+    
+    public virtual void SetInputData(byte[] data)
+    {
+        if (data == null || data.Length != NumChannels)
         {
-            Debug.LogWarning("Received null DMX data");
+            Debug.LogWarning($"Invalid input DMX data for {gameObject.name}. Expected {NumChannels} channels, got {data?.Length ?? 0}.");
             return;
         }
         
-        if (data.Length != NumChannels)
-        {
-            Debug.LogWarning($"Data length mismatch. Expected {NumChannels}, got {data.Length}");
-            // Resize data to match expected length
-            var resizedData = new byte[NumChannels];
-            System.Array.Copy(data, resizedData, Mathf.Min(data.Length, NumChannels));
-            data = resizedData;
-        }
-        
-        dmxData = data;
+        inputData = data;
         
         if (deviceMode == DMXDeviceMode.Input || deviceMode == DMXDeviceMode.Bidirectional)
         {
-            dataConsumer?.ApplyData(dmxData);
+            ProcessInputData(inputData);
         }
     }
     
-    // Internal method to update DMX data (used by data providers)
-    protected virtual void UpdateInternalDMXData(byte[] data)
-    {
-        if (data == null)
-        {
-            Debug.LogWarning("Received null DMX data");
-            return;
-        }
-        
-        if (data.Length != NumChannels)
-        {
-            Debug.LogWarning($"Data length mismatch. Expected {NumChannels}, got {data.Length}");
-            // Resize data to match expected length
-            var resizedData = new byte[NumChannels];
-            System.Array.Copy(data, resizedData, Mathf.Min(data.Length, NumChannels));
-            data = resizedData;
-        }
-        
-        dmxData = data;
-        
-        // Debug output to verify data is being updated
-        Debug.Log($"DMX data updated for {gameObject.name}: [{string.Join(", ", dmxData)}]");
-    }
+    #endregion
     
-    // Legacy method for backward compatibility
-    public virtual void SetData(byte[] data)
-    {
-        SetDMXData(data);
-    }
+    #region Unity Lifecycle
     
-    // IDMXChannelProcessor interface implementations
-    public virtual void ProcessChannel(ChannelFunction function, byte value, byte fineValue = 0)
-    {
-        if (channelMap.ContainsKey(function))
-        {
-            var command = new SetChannelCommand(this, channelMap[function], value);
-            commandInvoker.ExecuteCommand(command);
-            
-            // Handle fine channel if provided
-            if (fineValue > 0)
-            {
-                var fineFunction = GetFineChannelFunction(function);
-                if (channelMap.ContainsKey(fineFunction))
-                {
-                    var fineCommand = new SetChannelCommand(this, channelMap[fineFunction], fineValue);
-                    commandInvoker.ExecuteCommand(fineCommand);
-                }
-            }
-        }
-    }
-    
-    public virtual byte ReadChannel(ChannelFunction function)
-    {
-        if (channelMap.ContainsKey(function))
-        {
-            int channelIndex = channelMap[function];
-            if (dmxData != null && channelIndex < dmxData.Length)
-                return dmxData[channelIndex];
-        }
-        return 0;
-    }
-    
-    // Unity lifecycle methods
     protected virtual void Start()
     {
-        communicator = FindFirstObjectByType<DmxController>() as IDMXCommunicator;
-        commandInvoker = new DMXCommandInvoker();
-        
-        if (dmxData == null)
-            dmxData = new byte[NumChannels];
-            
-        InitializeChannelMap();
-        InitializeDataProviderAndConsumer();
-        
-        if (communicator != null)
-            communicator.RegisterDevice(this);
+        InitializeDataArrays();
+        RegisterWithCommunicator();
     }
     
     protected virtual void Update()
     {
-        if (deviceMode == DMXDeviceMode.Output || deviceMode == DMXDeviceMode.Bidirectional)
-        {
-            if (autoUpdate && Time.time - lastUpdateTime > 1f / updateRate)
-            {
-                if (dataProvider != null)
-                {
-                    var readCommand = new ReadFromGameObjectCommand(this, dataProvider);
-                    commandInvoker.ExecuteCommand(readCommand);
-                }
-                
-                // Send data to controller (will be batched)
-                if (communicator != null)
-                    communicator.SendData(this);
-                    
-                lastUpdateTime = Time.time;
-            }
-        }
+        HandleOutputMode();
     }
     
     protected virtual void OnDestroy()
     {
+        communicator?.UnregisterDevice(this);
+    }
+    
+    #endregion
+    
+    #region Initialization
+    
+    private void InitializeDataArrays()
+    {
+        if (inputData == null || inputData.Length != NumChannels)
+            inputData = new byte[NumChannels];
+        if (outputData == null || outputData.Length != NumChannels)
+            outputData = new byte[NumChannels];
+    }
+    
+    private void RegisterWithCommunicator()
+    {
+        communicator = FindFirstObjectByType<DmxController>() as IDMXCommunicator;
         if (communicator != null)
-            communicator.UnregisterDevice(this);
-    }
-    
-    // Abstract methods that derived classes must implement
-    protected abstract void InitializeChannelMap();
-    protected abstract void InitializeDataProviderAndConsumer();
-    
-    // Helper methods
-    protected virtual ChannelFunction GetFineChannelFunction(ChannelFunction baseFunction)
-    {
-        switch (baseFunction)
         {
-            case ChannelFunction.Color_R: return ChannelFunction.Color_RFine;
-            case ChannelFunction.Color_G: return ChannelFunction.Color_GFine;
-            case ChannelFunction.Color_B: return ChannelFunction.Color_BFine;
-            case ChannelFunction.Color_W: return ChannelFunction.Color_WFine;
-            case ChannelFunction.Pan: return ChannelFunction.PanFine;
-            case ChannelFunction.Tilt: return ChannelFunction.TiltFine;
-            case ChannelFunction.Intensity: return ChannelFunction.IntensityFine;
-            default: return ChannelFunction.Unknown;
+            communicator.RegisterDevice(this);
+        }
+        else
+        {
+            Debug.LogWarning($"No DmxController found for device {gameObject.name}");
         }
     }
     
-    // Convenience methods for common operations
-    public void SetColor(Color color)
+    private void HandleOutputMode()
     {
-        var command = new SetColorCommand(this, color, 
-            channelMap.ContainsKey(ChannelFunction.Color_R) ? channelMap[ChannelFunction.Color_R] : 0,
-            channelMap.ContainsKey(ChannelFunction.Color_G) ? channelMap[ChannelFunction.Color_G] : 1,
-            channelMap.ContainsKey(ChannelFunction.Color_B) ? channelMap[ChannelFunction.Color_B] : 2);
-        commandInvoker.ExecuteCommand(command);
-    }
-    
-    public void UndoLastCommand()
-    {
-        commandInvoker?.UndoLastCommand();
-    }
-    
-    public void SetIntensity(float intensity)
-    {
-        if (channelMap.ContainsKey(ChannelFunction.Intensity))
+        if ((deviceMode == DMXDeviceMode.Output || deviceMode == DMXDeviceMode.Bidirectional) && 
+            autoUpdate && 
+            Time.time - lastUpdateTime > 1f / updateRate &&
+            outputData != null && 
+            outputData.Length >= NumChannels)
         {
-            var command = new SetChannelCommand(this, channelMap[ChannelFunction.Intensity], (byte)(intensity * 255));
-            commandInvoker.ExecuteCommand(command);
+            if (UpdateOutputData())
+            {
+                communicator?.SendData(this);
+            }
+            lastUpdateTime = Time.time;
         }
     }
     
-    public void SetDimmer(float dimmer)
+    #endregion
+    
+    #region Abstract Methods
+    
+    protected abstract void ProcessInputData(byte[] data);
+    protected abstract bool UpdateOutputData();
+    
+    #endregion
+    
+    #region Name Management
+    
+    public void StoreOriginalName()
     {
-        if (channelMap.ContainsKey(ChannelFunction.Dimmer))
+        if (string.IsNullOrEmpty(originalName))
         {
-            var command = new SetChannelCommand(this, channelMap[ChannelFunction.Dimmer], (byte)(dimmer * 255));
-            commandInvoker.ExecuteCommand(command);
+            originalName = gameObject.name;
         }
     }
     
-    // Gizmo drawing methods
+    public string GetOriginalName() => string.IsNullOrEmpty(originalName) ? gameObject.name : originalName;
+    
+    public void RestoreOriginalName()
+    {
+        if (!string.IsNullOrEmpty(originalName))
+        {
+            gameObject.name = originalName;
+        }
+    }
+    
+    public int GetAssignedUniverse() => assignedUniverse;
+    
+    public string GetChannelInfo()
+    {
+        return startChannel > 0 ? 
+            $"U{assignedUniverse}:Ch{startChannel}-{startChannel + NumChannels - 1}" : 
+            "Not Assigned";
+    }
+    
+    #endregion
+    
+    #region Context Menu Actions
+    
+    [ContextMenu("Restore Original Name")]
+    public void RestoreOriginalNameMenu() => RestoreOriginalName();
+    
+    [ContextMenu("Update Name with Channel Info")]
+    public void UpdateNameWithChannelInfo()
+    {
+        if (communicator is DmxController controller)
+        {
+            controller.UpdateDeviceName(this, assignedUniverse, startChannel);
+        }
+    }
+    
+    [ContextMenu("Print Channel Assignment")]
+    public void PrintChannelAssignment()
+    {
+        Debug.Log($"Device: {GetOriginalName()}\nAssignment: {GetChannelInfo()}\nMode: {DeviceMode}");
+    }
+    
+    #endregion
+    
+    #region Channel Access Methods
+    
+    public void SetInputChannel(int channel, byte value)
+    {
+        if (IsValidChannel(channel))
+        {
+            inputData[channel] = value;
+            ProcessInputData(inputData);
+        }
+    }
+    
+    public void SetOutputChannel(int channel, byte value)
+    {
+        if (IsValidChannel(channel))
+        {
+            outputData[channel] = value;
+        }
+    }
+    
+    public byte GetInputChannel(int channel) => IsValidChannel(channel) ? inputData[channel] : (byte)0;
+    public byte GetOutputChannel(int channel) => IsValidChannel(channel) ? outputData[channel] : (byte)0;
+    
+    private bool IsValidChannel(int channel) => channel >= 0 && channel < NumChannels;
+    
+    #endregion
+    
+    #region Legacy Compatibility
+    
+    public virtual void SetData(byte[] data) => SetInputData(data);
+    public virtual byte[] GetDMXData() => deviceMode == DMXDeviceMode.Output ? outputData : inputData;
+    public virtual void SetDMXData(byte[] data) => SetInputData(data);
+    
+    #endregion
+    
+    #region Gizmos
+    
     protected virtual void OnDrawGizmos()
     {
         if (showChannelGizmos && Application.isPlaying)
@@ -247,57 +265,67 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcesso
         }
     }
     
-    protected virtual void DrawChannelGizmos()
+    private void DrawChannelGizmos()
     {
         if (StartChannel <= 0) return;
         
         Vector3 position = transform.position + gizmoOffset;
         
-        // Draw channel range text
         string channelText = GetChannelDisplayText();
         DrawGizmoText(position, channelText, gizmoTextColor);
         
-        // Draw individual channel values if we have data
-        if (dmxData != null && dmxData.Length > 0)
-        {
-            DrawChannelValues(position);
-        }
+        DrawChannelValues(position);
     }
     
     protected virtual string GetChannelDisplayText()
     {
-        if (NumChannels == 1)
-        {
-            return $"Ch: {StartChannel}";
-        }
-        else
-        {
-            return $"Ch: {StartChannel}-{StartChannel + NumChannels - 1}";
-        }
+        return $"{GetOriginalName()} ({deviceMode})\n{GetChannelInfo()}";
     }
     
     protected virtual void DrawChannelValues(Vector3 basePosition)
     {
+        switch (deviceMode)
+        {
+            case DMXDeviceMode.Input:
+                DrawDataArray(basePosition, inputData, "IN", Color.cyan);
+                break;
+            case DMXDeviceMode.Output:
+                DrawDataArray(basePosition, outputData, "OUT", Color.yellow);
+                break;
+            case DMXDeviceMode.Bidirectional:
+                DrawDataArray(basePosition, inputData, "IN", Color.cyan);
+                DrawDataArray(basePosition + Vector3.right * 2f, outputData, "OUT", Color.yellow);
+                break;
+        }
+    }
+    
+    protected virtual void DrawDataArray(Vector3 basePosition, byte[] data, string label, Color color)
+    {
+        if (data == null) return;
+        
         float lineHeight = 0.3f * gizmoTextSize;
         
-        for (int i = 0; i < dmxData.Length && i < NumChannels; i++)
+        DrawGizmoText(basePosition + Vector3.down * lineHeight, label, color);
+        
+        for (int i = 0; i < data.Length && i < NumChannels; i++)
         {
-            Vector3 textPosition = basePosition + Vector3.down * (lineHeight * (i + 1));
-            string channelValue = $"{StartChannel + i}: {dmxData[i]}";
-            
-            // Color code based on value
-            Color valueColor = GetChannelValueColor(dmxData[i]);
+            Vector3 textPosition = basePosition + Vector3.down * (lineHeight * (i + 2));
+            string channelValue = $"{StartChannel + i}: {data[i]}";
+            Color valueColor = GetChannelValueColor(data[i]);
             DrawGizmoText(textPosition, channelValue, valueColor);
         }
     }
     
     protected virtual Color GetChannelValueColor(byte value)
     {
-        if (value == 0) return Color.gray;
-        if (value < 64) return Color.red;
-        if (value < 128) return Color.yellow;
-        if (value < 192) return Color.green;
-        return Color.cyan;
+        return value switch
+        {
+            0 => Color.gray,
+            < 64 => Color.red,
+            < 128 => Color.yellow,
+            < 192 => Color.green,
+            _ => Color.cyan
+        };
     }
     
     protected virtual void DrawGizmoText(Vector3 position, string text, Color color)
@@ -311,4 +339,6 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice, IDMXChannelProcesso
         });
         #endif
     }
+    
+    #endregion
 }

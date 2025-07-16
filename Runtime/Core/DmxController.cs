@@ -9,411 +9,581 @@ using ArtNet.Packets;
 
 public class DmxController : MonoBehaviour, IDMXCommunicator
 {
-    [Header("send dmx")]
-    public bool useBroadcast;
+    [Header("Network Configuration")]
+    public bool useBroadcast = true;
     public string remoteIP = "localhost";
-    
-    [Header("Port Configuration")]
     public bool useCustomPort = false;
-    public int customPort = 6454; // Default Art-Net port
-    
-    [Header("Batched Sending")]
-    public float batchSendRate = 30f; // How often to send batched data
-    public bool enableBatchedSending = true;
-    
-    [Header("Auto Channel Assignment")]
-    public bool autoAssignChannels = true; // Enable automatic channel assignment
-    
-    IPEndPoint remote;
+    public int customPort = 6454;
+    public bool isServer = true;
+    public string deviceNameFormat = "{originalName} [U{universe}:Ch{startChannel}-{endChannel}]";
 
-    [Header("dmx devices")]
-    public UniverseDevices[] universes;
-    public bool isServer;
-
-    ArtNetSocket artnet;
-    [Header("send/recieved DMX data for debug")]
-    [SerializeField] ArtNetDmxPacket latestReceivedDMX;
-    [SerializeField] ArtNetDmxPacket dmxToSend;
-    byte[] _dmxData;
-
-    Dictionary<int, byte[]> dmxDataMap;
-    private List<IDMXDevice> registeredDevices = new List<IDMXDevice>();
+    [Header("Performance Settings")]
+    public float sendRate = 30f;
+    public bool enableBatching = true;
+    public int maxUniverses = 16;
     
-    // Universe output buffers and batching
-    private Dictionary<int, byte[]> universeOutputBuffers = new Dictionary<int, byte[]>();
-    private Dictionary<int, bool> universeDirtyFlags = new Dictionary<int, bool>();
-    private float lastBatchSendTime;
-
-    public bool newPacket;
-    // IDMXCommunicator interface implementations
-    public void SendData(IDMXDevice device)
+    [Header("Auto Discovery")]
+    public bool autoDiscoverDevices = true;
+    public bool discoverOnStart = true;
+    
+    [Header("Debug")]
+    public bool showDebugLogs = false;
+    
+    // Network components
+    private ArtNetSocket artnet;
+    private IPEndPoint remote;
+    private ArtNetDmxPacket dmxPacket;
+    
+    // Device management
+    private Dictionary<int, List<IDMXDevice>> devicesByUniverse = new Dictionary<int, List<IDMXDevice>>();
+    private Dictionary<int, byte[]> universeBuffers = new Dictionary<int, byte[]>();
+    private Dictionary<int, bool> universeDirty = new Dictionary<int, bool>();
+    private Dictionary<int, byte[]> incomingData = new Dictionary<int, byte[]>();
+    
+    // Timing
+    private float lastSendTime;
+    
+    // Events
+    public System.Action<int, byte[]> OnUniverseDataReceived;
+    public System.Action<IDMXDevice> OnDeviceRegistered;
+    public System.Action<IDMXDevice> OnDeviceUnregistered;
+    
+    #region Unity Lifecycle
+    
+    void Start()
     {
-        if (!enableBatchedSending)
+        InitializeArtNet();
+        dmxPacket = new ArtNetDmxPacket();
+        dmxPacket.DmxData = new byte[512];
+        
+        LogDebug($"DMX Controller initialized - Batching: {enableBatching}, Send Rate: {sendRate}Hz");
+        
+        // Discover devices automatically if enabled
+        if (discoverOnStart)
         {
-            // Fall back to immediate sending if batching is disabled
-            SendDataImmediate(device);
-            return;
+            DiscoverDevices();
         }
-        
-        if (device.GetDMXData() == null || device.GetDMXData().Length == 0)
-            return;
-            
-        // Find which universe this device belongs to
-        var universeDevices = universes.FirstOrDefault(u => u.devices.Contains(device as DMXDevice));
-        if (universeDevices == null)
-        {
-            Debug.LogWarning($"Device {device} not found in any universe!");
-            return;
-        }
-        
-        int universeId = universeDevices.universe;
-        
-        // Get or create the output buffer for this universe
-        if (!universeOutputBuffers.ContainsKey(universeId))
-        {
-            universeOutputBuffers[universeId] = new byte[512];
-        }
-        
-        byte[] universeBuffer = universeOutputBuffers[universeId];
-        
-        // Copy device data to the correct channel positions in the universe buffer
-        var deviceData = device.GetDMXData();
-        for (int i = 0; i < deviceData.Length && (device.StartChannel + i) < 512; i++)
-        {
-            universeBuffer[device.StartChannel + i] = deviceData[i];
-        }
-        
-        // Mark this universe as dirty (needs to be sent)
-        universeDirtyFlags[universeId] = true;
-        
-        // Debug: Show what we're putting in the buffer
-        Debug.Log($"Device {device} updated universe {universeId} channels {device.StartChannel}-{device.StartChannel + deviceData.Length - 1}: [{string.Join(", ", deviceData)}]");
     }
     
-    // Immediate sending (fallback for when batching is disabled)
-    private void SendDataImmediate(IDMXDevice device)
+    void Update()
     {
-        if (device.GetDMXData() == null || device.GetDMXData().Length == 0)
-            return;
-            
-        // Find which universe this device belongs to
-        var universeDevices = universes.FirstOrDefault(u => u.devices.Contains(device as DMXDevice));
-        if (universeDevices == null)
+        ProcessIncomingData();
+        
+        if (enableBatching && Time.time - lastSendTime >= 1f / sendRate)
         {
-            Debug.LogWarning($"Device {device} not found in any universe!");
-            return;
+            SendDirtyUniverses();
+            lastSendTime = Time.time;
         }
-        
-        int universeId = universeDevices.universe;
-        
-        // Get or create the output buffer for this universe
-        if (!universeOutputBuffers.ContainsKey(universeId))
-        {
-            universeOutputBuffers[universeId] = new byte[512];
-        }
-        
-        byte[] universeBuffer = universeOutputBuffers[universeId];
-        
-        // Copy device data to the correct channel positions in the universe buffer
-        var deviceData = device.GetDMXData();
-        for (int i = 0; i < deviceData.Length && (device.StartChannel + i) < 512; i++)
-        {
-            universeBuffer[device.StartChannel + i] = deviceData[i];
-        }
-        
-        // Send immediately
-        Send((short)universeId, universeBuffer);
     }
     
-    // Method to send all dirty universes (called in Update)
-    private void SendBatchedData()
+    void OnDestroy()
     {
-        if (Time.time - lastBatchSendTime < 1f / batchSendRate)
-            return;
-            
-        // Create a copy of the keys to avoid modification during enumeration
-        var universesToSend = new List<int>();
-        
-        // First, collect all dirty universes
-        foreach (var kvp in universeDirtyFlags)
-        {
-            if (kvp.Value && universeOutputBuffers.ContainsKey(kvp.Key))
-            {
-                universesToSend.Add(kvp.Key);
-            }
-        }
-        
-        // Then send them and clear dirty flags
-        foreach (int universeId in universesToSend)
-        {
-            Send((short)universeId, universeOutputBuffers[universeId]);
-            universeDirtyFlags[universeId] = false; // Clear dirty flag
-            
-            // Debug: Show what we're sending
-            var buffer = universeOutputBuffers[universeId];
-            var nonZeroChannels = buffer.Select((value, index) => new { value, index })
-                                       .Where(x => x.value > 0)
-                                       .ToArray();
-            
-            if (nonZeroChannels.Length > 0)
-            {
-                Debug.Log($"Sent universe {universeId} - Non-zero channels: {string.Join(", ", nonZeroChannels.Select(x => $"Ch{x.index}={x.value}"))}");
-            }
-        }
-        
-        lastBatchSendTime = Time.time;
+        artnet?.Close();
     }
     
-    // Force send all universes immediately (useful for testing)
-    [ContextMenu("Force Send All Universes")]
-    public void ForceSendAllUniverses()
-    {
-        // Use ToArray() to avoid modification during enumeration
-        foreach (var kvp in universeOutputBuffers.ToArray())
-        {
-            int universeId = kvp.Key;
-            byte[] buffer = kvp.Value;
-            Send((short)universeId, buffer);
-        }
-    }
+    #endregion
+    
+    #region Device Management
     
     public void RegisterDevice(IDMXDevice device)
     {
-        if (!registeredDevices.Contains(device))
+        if (device == null) return;
+        
+        // Store original name if we haven't already
+        if (device is DMXDevice dmxDevice)
         {
-            registeredDevices.Add(device);
-            
-            // Auto-assign channels if enabled
-            if (autoAssignChannels)
-            {
-                AssignDeviceToUniverse(device);
-            }
+            dmxDevice.StoreOriginalName();
         }
+        
+        // Ask device where it wants to be placed
+        var preferredPlacement = device.GetPreferredPlacement();
+        var actualPlacement = ProcessPlacementRequest(device, preferredPlacement);
+        
+        // Assign the device to its placement
+        device.OnPlacementAssigned(actualPlacement.universe, actualPlacement.startChannel);
+        
+        // Update GameObject name if enabled
+        if (device is DMXDevice dmxDev)
+        {
+            UpdateDeviceName(dmxDev, actualPlacement.universe, actualPlacement.startChannel);
+        }
+        
+        // Add to universe tracking
+        if (!devicesByUniverse.ContainsKey(actualPlacement.universe))
+        {
+            devicesByUniverse[actualPlacement.universe] = new List<IDMXDevice>();
+            universeBuffers[actualPlacement.universe] = new byte[512];
+            universeDirty[actualPlacement.universe] = false;
+        }
+        
+        if (!devicesByUniverse[actualPlacement.universe].Contains(device))
+        {
+            devicesByUniverse[actualPlacement.universe].Add(device);
+            LogDebug($"Registered device '{device}' to Universe {actualPlacement.universe}, channels {actualPlacement.startChannel}-{actualPlacement.startChannel + device.NumChannels - 1}");
+            
+            OnDeviceRegistered?.Invoke(device);
+        }
+    }
+    
+public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
+    {
+        if (device == null) return;
+        
+        string originalName = device.GetOriginalName();
+        int endChannel = startChannel + device.NumChannels - 1;
+        
+        string newName = deviceNameFormat
+            .Replace("{originalName}", originalName)
+            .Replace("{universe}", universe.ToString())
+            .Replace("{startChannel}", startChannel.ToString())
+            .Replace("{endChannel}", endChannel.ToString())
+            .Replace("{numChannels}", device.NumChannels.ToString())
+            .Replace("{deviceMode}", device.DeviceMode.ToString());
+        
+        device.gameObject.name = newName;
+        
+        LogDebug($"Updated device name: '{originalName}' -> '{newName}'");
     }
     
     public void UnregisterDevice(IDMXDevice device)
     {
-        registeredDevices.Remove(device);
-    }
-    
-    [Header("Channel Layout")]
-    public IChannelLayoutStrategy layoutStrategy;
-    
-    // Serialized fields for inspector configuration
-    [SerializeField] private LayoutType currentLayoutType = LayoutType.Sequential;
-    [SerializeField] private MatrixChannelLayout matrixLayout = new MatrixChannelLayout();
-    [SerializeField] private SequentialChannelLayout sequentialLayout = new SequentialChannelLayout();
-    
-    public enum LayoutType
-    {
-        Sequential,
-        Matrix,
-        Drawn
-    }
-    
-    void Start()
-    {
-        // Initialize layout strategy based on selection
-        UpdateLayoutStrategy();
+        if (device == null) return;
         
-        artnet = new ArtNetSocket();
-        if (isServer)
-            artnet.Open(FindFromHostName("localhost"), null);
-        
-        dmxToSend.DmxData = new byte[512];
-
-        artnet.NewPacket += (object sender, NewPacketEventArgs<ArtNetPacket> e) =>
+        // Remove from all universes
+        foreach (var kvp in devicesByUniverse.ToArray())
         {
-            newPacket = true;
-            if (e.Packet.OpCode == ArtNet.Enums.ArtNetOpCodes.Dmx)
+            if (kvp.Value.Remove(device))
             {
-                var packet = latestReceivedDMX = e.Packet as ArtNetDmxPacket;
-
-                if (packet.DmxData != _dmxData)
-                    _dmxData = packet.DmxData;
-
-                var universe = packet.Universe;
-                if (dmxDataMap.ContainsKey(universe))
-                    dmxDataMap[universe] = packet.DmxData;
-                else
-                    dmxDataMap.Add(universe, packet.DmxData);
+                LogDebug($"Unregistered device '{device}' from Universe {kvp.Key}");
+                
+                // Clean up empty universes
+                if (kvp.Value.Count == 0)
+                {
+                    devicesByUniverse.Remove(kvp.Key);
+                    universeBuffers.Remove(kvp.Key);
+                    universeDirty.Remove(kvp.Key);
+                }
             }
-        };
-
+        }
+        
+        OnDeviceUnregistered?.Invoke(device);
+    }
+    
+    private DMXPlacement ProcessPlacementRequest(IDMXDevice device, DMXPlacement preferred)
+    {
+        // Check if preferred placement is available
+        if (preferred.startChannel > 0 && IsPlacementAvailable(preferred.universe, preferred.startChannel, device.NumChannels))
+        {
+            LogDebug($"Device '{device}' got preferred placement: Universe {preferred.universe}, Channel {preferred.startChannel}");
+            return preferred;
+        }
+        
+        // If preferred placement is not available, check if device allows auto-assignment
+        if (preferred.autoAssign)
+        {
+            var suggested = SuggestPlacement(device);
+            LogDebug($"Device '{device}' auto-assigned to: Universe {suggested.universe}, Channel {suggested.startChannel}");
+            return suggested;
+        }
+        
+        // If no auto-assignment allowed, try to resolve conflict based on priority
+        var resolved = ResolveConflict(device, preferred);
+        if (resolved.startChannel > 0)
+        {
+            LogDebug($"Device '{device}' placement conflict resolved: Universe {resolved.universe}, Channel {resolved.startChannel}");
+            return resolved;
+        }
+        
+        // Fallback to auto-assignment
+        Debug.LogWarning($"Device '{device}' placement failed, falling back to auto-assignment");
+        return SuggestPlacement(device);
+    }
+    
+    public bool IsPlacementAvailable(int universe, int startChannel, int numChannels)
+    {
+        if (startChannel <= 0 || startChannel + numChannels - 1 > 512)
+            return false;
+        
+        if (!devicesByUniverse.ContainsKey(universe))
+            return true;
+        
+        // Check for conflicts with existing devices
+        foreach (var existingDevice in devicesByUniverse[universe])
+        {
+            int existingStart = existingDevice.StartChannel;
+            int existingEnd = existingStart + existingDevice.NumChannels - 1;
+            int requestedEnd = startChannel + numChannels - 1;
+            
+            // Check for overlap
+            if (!(requestedEnd < existingStart || startChannel > existingEnd))
+            {
+                return false; // Overlap detected
+            }
+        }
+        
+        return true;
+    }
+    
+    public DMXPlacement SuggestPlacement(IDMXDevice device)
+    {
+        int requiredChannels = device.NumChannels;
+        
+        // Try to find space in existing universes first
+        foreach (var kvp in devicesByUniverse.OrderBy(x => x.Key))
+        {
+            int universe = kvp.Key;
+            var suggestion = FindAvailableChannels(universe, requiredChannels);
+            if (suggestion.startChannel > 0)
+            {
+                return DMXPlacement.Manual(universe, suggestion.startChannel, true);
+            }
+        }
+        
+        // Create new universe if needed
+        int newUniverse = GetNextAvailableUniverse();
+        return DMXPlacement.Manual(newUniverse, 1, true);
+    }
+    
+    private DMXPlacement FindAvailableChannels(int universe, int requiredChannels)
+    {
+        if (!devicesByUniverse.ContainsKey(universe))
+        {
+            return DMXPlacement.Manual(universe, 1, true);
+        }
+        
+        // Get all occupied ranges and sort them
+        var occupiedRanges = devicesByUniverse[universe]
+            .Select(d => new { Start = d.StartChannel, End = d.StartChannel + d.NumChannels - 1 })
+            .OrderBy(r => r.Start)
+            .ToList();
+        
+        // Find first available gap
+        int nextAvailable = 1;
+        foreach (var range in occupiedRanges)
+        {
+            if (nextAvailable + requiredChannels - 1 < range.Start)
+            {
+                return DMXPlacement.Manual(universe, nextAvailable, true);
+            }
+            nextAvailable = range.End + 1;
+        }
+        
+        // Check if there's space at the end
+        if (nextAvailable + requiredChannels - 1 <= 512)
+        {
+            return DMXPlacement.Manual(universe, nextAvailable, true);
+        }
+        
+        return DMXPlacement.Manual(universe, 0, true); // No space found
+    }
+    
+    private DMXPlacement ResolveConflict(IDMXDevice newDevice, DMXPlacement preferred)
+    {
+        if (!devicesByUniverse.ContainsKey(preferred.universe))
+            return preferred;
+        
+        // Find conflicting devices
+        var conflictingDevices = devicesByUniverse[preferred.universe]
+            .Where(d => {
+                int existingStart = d.StartChannel;
+                int existingEnd = existingStart + d.NumChannels - 1;
+                int requestedEnd = preferred.startChannel + newDevice.NumChannels - 1;
+                return !(requestedEnd < existingStart || preferred.startChannel > existingEnd);
+            })
+            .ToList();
+        
+        // Check if new device has higher priority than all conflicting devices
+        foreach (var conflictingDevice in conflictingDevices)
+        {
+            if (conflictingDevice is DMXDevice dmxDevice)
+            {
+                var conflictingPlacement = dmxDevice.GetPreferredPlacement();
+                if (conflictingPlacement.priority >= preferred.priority)
+                {
+                    return DMXPlacement.Manual(preferred.universe, 0, true); // Conflict not resolved
+                }
+            }
+        }
+        
+        // Move conflicting devices if new device has higher priority
+        foreach (var conflictingDevice in conflictingDevices)
+        {
+            UnregisterDevice(conflictingDevice);
+            RegisterDevice(conflictingDevice); // Will trigger re-assignment
+        }
+        
+        return preferred;
+    }
+    
+    private int GetNextAvailableUniverse()
+    {
+        for (int i = 0; i < maxUniverses; i++)
+        {
+            if (!devicesByUniverse.ContainsKey(i))
+            {
+                return i;
+            }
+        }
+        return maxUniverses - 1; // Fallback
+    }
+    
+    #endregion
+    
+    #region Data Transmission
+    
+    public void SendData(IDMXDevice device)
+    {
+        if (device?.GetOutputData() == null) return;
+        
+        int universe = GetDeviceUniverse(device);
+        
+        if (!universeBuffers.ContainsKey(universe))
+        {
+            universeBuffers[universe] = new byte[512];
+            universeDirty[universe] = false;
+        }
+        
+        // Copy device data to universe buffer
+        var outputData = device.GetOutputData();
+        int startIndex = (device.StartChannel - 1) % 512; // Handle multi-universe scenarios
+        
+        for (int i = 0; i < outputData.Length && (startIndex + i) < 512; i++)
+        {
+            universeBuffers[universe][startIndex + i] = outputData[i];
+        }
+        
+        universeDirty[universe] = true;
+        
+        // Send immediately if batching is disabled
+        if (!enableBatching)
+        {
+            SendUniverse(universe);
+        }
+    }
+    
+    private void SendDirtyUniverses()
+    {
+        foreach (var kvp in universeDirty.ToArray())
+        {
+            if (kvp.Value)
+            {
+                SendUniverse(kvp.Key);
+                universeDirty[kvp.Key] = false;
+            }
+        }
+    }
+    
+    private void SendUniverse(int universe)
+    {
+        if (!universeBuffers.ContainsKey(universe)) return;
+        
+        dmxPacket.Universe = (short)universe;
+        System.Buffer.BlockCopy(universeBuffers[universe], 0, dmxPacket.DmxData, 0, 512);
+        
+        try
+        {
+            if (useBroadcast && isServer)
+            {
+                artnet.Send(dmxPacket);
+            }
+            else
+            {
+                artnet.Send(dmxPacket, remote);
+            }
+            
+            LogDebug($"Sent Art-Net data for universe {universe}");
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"Failed to send Art-Net data for universe {universe}: {ex.Message}");
+        }
+    }
+    
+    #endregion
+    
+    #region Data Reception
+    
+    private void InitializeArtNet()
+    {
+        artnet = new ArtNetSocket();
+        
+        if (isServer)
+        {
+            artnet.Open(FindFromHostName("localhost"), null);
+        }
+        
+        artnet.NewPacket += OnArtNetPacketReceived;
+        
         if (!useBroadcast || !isServer)
         {
-            int portToUse = useCustomPort ? customPort : ArtNetSocket.Port;
-            remote = new IPEndPoint(FindFromHostName(remoteIP), portToUse);
-        }
-
-        dmxDataMap = new Dictionary<int, byte[]>();
-        universeOutputBuffers = new Dictionary<int, byte[]>();
-        universeDirtyFlags = new Dictionary<int, bool>();
-        
-        // Initialize all universes on start
-        if (universes != null)
-        {
-            foreach (var universe in universes)
-            {
-                universe.Initialize();
-            }
+            int port = useCustomPort ? customPort : ArtNetSocket.Port;
+            remote = new IPEndPoint(FindFromHostName(remoteIP), port);
         }
     }
     
-    [SerializeField] private DrawnChannelLayout drawnLayout = new DrawnChannelLayout();
-    
-    private void UpdateLayoutStrategy()
+    private void OnArtNetPacketReceived(object sender, NewPacketEventArgs<ArtNetPacket> e)
     {
-        switch (currentLayoutType)
+        if (e.Packet is ArtNetDmxPacket dmxPacket)
         {
-            case LayoutType.Sequential:
-                layoutStrategy = sequentialLayout;
-                break;
-            case LayoutType.Matrix:
-                layoutStrategy = matrixLayout;
-                break;
-            case LayoutType.Drawn:
-                layoutStrategy = drawnLayout;
-                break;
-        }
-    }
-    
-    // Method to apply drawn layout from the editor window
-    public void ApplyDrawnLayout(DrawnLayoutData layoutData)
-    {
-        drawnLayout.layoutData = layoutData;
-        currentLayoutType = LayoutType.Drawn;
-        UpdateLayoutStrategy();
-        ReassignAllChannels();
-    }
-    
-    // Called when inspector values change
-    private void OnValidate()
-    {
-        UpdateLayoutStrategy();
-        
-        if (universes != null)
-        {
-            foreach (var u in universes)
-            {
-                if (layoutStrategy != null)
-                {
-                    layoutStrategy.AssignChannels(u);
-                }
-                else
-                {
-                    u.Initialize(); // Fallback
-                }
-            }
-        }
-    }
-    
-    // Modified auto-assignment method - now uses only the interface
-    private void AssignDeviceToUniverse(IDMXDevice device)
-    {
-        var dmxDevice = device as DMXDevice;
-        if (dmxDevice == null) return;
-        
-        // Find the first universe that can fit this device
-        foreach (var universe in universes)
-        {
-            if (universe.devices == null) continue;
+            int universe = dmxPacket.Universe;
+            incomingData[universe] = dmxPacket.DmxData;
+            OnUniverseDataReceived?.Invoke(universe, dmxPacket.DmxData);
             
-            // Use the interface to check if device can fit
-            if (layoutStrategy != null && layoutStrategy.CanFitDevice(universe, device))
+            LogDebug($"Received Art-Net data for universe {universe}");
+        }
+    }
+    
+    private void ProcessIncomingData()
+    {
+        foreach (var kvp in incomingData.ToArray())
+        {
+            int universe = kvp.Key;
+            byte[] data = kvp.Value;
+            
+            if (data == null || !devicesByUniverse.ContainsKey(universe)) continue;
+            
+            // Send data to all input devices in this universe
+            foreach (var device in devicesByUniverse[universe])
             {
-                // Add device to universe if not already present
-                if (!universe.devices.Contains(dmxDevice))
+                if (device.DeviceMode == DMXDeviceMode.Input || device.DeviceMode == DMXDeviceMode.Bidirectional)
                 {
-                    var newDevicesList = new List<DMXDevice>(universe.devices ?? new DMXDevice[0]);
-                    newDevicesList.Add(dmxDevice);
-                    universe.devices = newDevicesList.ToArray();
+                    int startIndex = (device.StartChannel - 1) % 512;
+                    if (startIndex >= 0 && startIndex < data.Length)
+                    {
+                        int length = Mathf.Min(device.NumChannels, data.Length - startIndex);
+                        byte[] deviceData = new byte[length];
+                        System.Array.Copy(data, startIndex, deviceData, 0, length);
+                        device.SetInputData(deviceData);
+                    }
                 }
-                
-                // Use the interface to assign channels
-                layoutStrategy.AssignChannels(universe);
-                
-                Debug.Log($"Auto-assigned device {dmxDevice.name} to universe {universe.universe} using {layoutStrategy.GetLayoutName()}");
-                return;
+            }
+            
+            incomingData[universe] = null;
+        }
+    }
+    
+    #endregion
+    
+    #region Device Discovery
+    
+    [ContextMenu("Discover Devices")]
+    public void DiscoverDevices()
+    {
+        if (!autoDiscoverDevices)
+            return;
+        
+        LogDebug("Discovering DMX devices in scene...");
+        
+        var discoveredDevices = DMXDeviceDiscovery.DiscoverDevices();
+        
+        foreach (var device in discoveredDevices)
+        {
+            RegisterDevice(device);
+        }
+        
+        LogDebug($"Discovered and registered {discoveredDevices.Count} DMX devices");
+    }
+    
+    #endregion
+    
+    #region Utility Methods
+    
+    private int GetDeviceUniverse(IDMXDevice device)
+    {
+        // Find which universe the device is currently in
+        foreach (var kvp in devicesByUniverse)
+        {
+            if (kvp.Value.Contains(device))
+            {
+                return kvp.Key;
             }
         }
         
-        string strategyName = layoutStrategy?.GetLayoutName() ?? "No Strategy";
-        Debug.LogWarning($"Could not auto-assign device {dmxDevice.name} using {strategyName}");
-    }
-    
-    // Reassign method - now uses only the interface
-    [ContextMenu("Reassign All Channels")]
-    public void ReassignAllChannels()
-    {
-        if (layoutStrategy == null) return;
-        
-        foreach (var universe in universes)
+        // Fallback: calculate based on channel number
+        if (device.StartChannel > 0)
         {
-            layoutStrategy.AssignChannels(universe);
-        }
-    }
-    
-    // Method to change layout at runtime
-    public void SetLayoutType(LayoutType type)
-    {
-        currentLayoutType = type;
-        UpdateLayoutStrategy();
-        ReassignAllChannels();
-    }
-
-    private void OnDestroy()
-    {
-        artnet.Close();
-    }
-
-    private void Update()
-    {
-        // Handle incoming DMX data
-        var keys = dmxDataMap.Keys.ToArray();
-        for (var i = 0; i < keys.Length; i++)
-        {
-            var universe = keys[i];
-            var dmxData = dmxDataMap[universe];
-            if (dmxData == null)
-                continue;
-
-            var universeDevices = universes.FirstOrDefault(u => u.universe == universe);
-            if (universeDevices != null)
-                foreach (var d in universeDevices.devices)
-                    d.SetData(dmxData.Skip(d.StartChannel).Take(d.NumChannels).ToArray());
-
-            dmxDataMap[universe] = null;
+            return (device.StartChannel - 1) / 512;
         }
         
-        // Send batched output data
-        if (enableBatchedSending)
-        {
-            SendBatchedData();
-        }
-    }
-
-    [ContextMenu("send DMX")]
-    public void Send()
-    {
-        if (useBroadcast && isServer)
-            artnet.Send(dmxToSend);
-        else
-            artnet.Send(dmxToSend, remote);
+        return 0;
     }
     
-    public void Send(short universe, byte[] dmxData)
+    private void LogDebug(string message)
     {
-        dmxToSend.Universe = universe;
-        System.Buffer.BlockCopy(dmxData, 0, dmxToSend.DmxData, 0, dmxData.Length);
-
-        if (useBroadcast && isServer)
-            artnet.Send(dmxToSend);
-        else
-            artnet.Send(dmxToSend, remote);
+        if (showDebugLogs)
+        {
+            Debug.Log($"[DMXController] {message}");
+        }
     }
-
-    static IPAddress FindFromHostName(string hostname)
+    
+    [ContextMenu("Print Device Info")]
+    public void PrintDeviceInfo()
+    {
+        Debug.Log("=== DMX Controller Device Info ===");
+        Debug.Log($"Total Devices: {GetDeviceCount()}");
+        Debug.Log($"Active Universes: {GetUniverseCount()}");
+        
+        foreach (var kvp in devicesByUniverse)
+        {
+            int usedChannels = GetUsedChannelsInUniverse(kvp.Key);
+            Debug.Log($"Universe {kvp.Key}: {kvp.Value.Count} devices, {usedChannels}/512 channels used");
+            
+            foreach (var device in kvp.Value)
+            {
+                Debug.Log($"  - {device} (Ch {device.StartChannel}-{device.StartChannel + device.NumChannels - 1}, Mode: {device.DeviceMode})");
+            }
+        }
+    }
+    
+    [ContextMenu("Force Send All")]
+    public void ForceSendAll()
+    {
+        foreach (var universe in universeBuffers.Keys)
+        {
+            SendUniverse(universe);
+        }
+    }
+    
+    [ContextMenu("Clear All Devices")]
+    public void ClearAllDevices()
+    {
+        var allDevices = devicesByUniverse.Values.SelectMany(list => list).ToArray();
+        foreach (var device in allDevices)
+        {
+            UnregisterDevice(device);
+        }
+        
+        Debug.Log("Cleared all registered devices");
+    }
+    
+    public void SetDeviceUniverse(IDMXDevice device, int universe, int startChannel = -1)
+    {
+        UnregisterDevice(device);
+        
+        if (startChannel > 0)
+        {
+            device.StartChannel = startChannel;
+        }
+        
+        RegisterDevice(device);
+    }
+    
+    private int GetUsedChannelsInUniverse(int universe)
+    {
+        if (!devicesByUniverse.ContainsKey(universe)) return 0;
+        
+        int maxChannel = 0;
+        foreach (var device in devicesByUniverse[universe])
+        {
+            maxChannel = Mathf.Max(maxChannel, device.StartChannel + device.NumChannels - 1);
+        }
+        return maxChannel;
+    }
+    
+    public int GetDeviceCount() => devicesByUniverse.Values.Sum(list => list.Count);
+    public int GetUniverseCount() => devicesByUniverse.Count;
+    
+    private static IPAddress FindFromHostName(string hostname)
     {
         var address = IPAddress.None;
         try
@@ -433,36 +603,14 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         }
         catch (System.Exception e)
         {
-            Debug.LogErrorFormat(
-                "Failed to find IP for :\n host name = {0}\n exception={1}",
-                hostname, e);
+            Debug.LogError($"Failed to find IP for hostname '{hostname}': {e.Message}");
         }
         return address;
     }
-
-    [System.Serializable]
-    public class UniverseDevices
-    {
-        public string universeName;
-        public int universe;
-        public DMXDevice[] devices;
-
-        public void Initialize()
-        {
-            if (devices == null) return;
-            
-            var startChannel = 0;
-            foreach (var d in devices)
-                if (d != null)
-                {
-                    d.StartChannel = startChannel;
-                    startChannel += d.NumChannels;
-                    d.name = string.Format("{0}:({1},{2:d3}-{3:d3})", d.GetType().ToString(), universe, d.StartChannel, startChannel - 1);
-                }
-            if (512 < startChannel)
-                Debug.LogErrorFormat("The number({0}) of channels of the universe {1} exceeds the upper limit(512 channels)!", startChannel, universe);
-        }
-    }
+    
+    #endregion
+    
+    #region Gizmos
     
     [Header("Gizmo Configuration")]
     [SerializeField] private bool showUniverseGizmos = true;
@@ -470,10 +618,9 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     [SerializeField] private Vector3 gizmoOffset = new Vector3(0, 2, 0);
     [SerializeField] private Color universeTextColor = Color.cyan;
     
-    // Add gizmo drawing methods
     private void OnDrawGizmos()
     {
-        if (showUniverseGizmos && universes != null)
+        if (showUniverseGizmos && devicesByUniverse != null)
         {
             DrawUniverseGizmos();
         }
@@ -481,7 +628,7 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     
     private void OnDrawGizmosSelected()
     {
-        if (showUniverseGizmos && universes != null)
+        if (showUniverseGizmos && devicesByUniverse != null)
         {
             DrawUniverseGizmos();
         }
@@ -491,48 +638,34 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     {
         Vector3 controllerPosition = transform.position + gizmoOffset;
         
-        // Draw controller info
-        string controllerInfo = $"DMX Controller\nLayout: {layoutStrategy?.GetLayoutName() ?? "None"}";
+        string controllerInfo = $"DMX Controller\nDevices: {GetDeviceCount()}\nUniverses: {GetUniverseCount()}";
         DrawGizmoText(controllerPosition, controllerInfo, universeTextColor);
         
-        // Draw universe summary
-        for (int i = 0; i < universes.Length; i++)
+        int i = 0;
+        foreach (var kvp in devicesByUniverse.OrderBy(x => x.Key))
         {
-            var universe = universes[i];
-            if (universe.devices == null) continue;
+            int universe = kvp.Key;
+            var devices = kvp.Value;
             
             Vector3 universePosition = controllerPosition + Vector3.down * (0.5f * gizmoTextSize * (i + 2));
-            string universeInfo = GetUniverseInfo(universe);
+            string universeInfo = GetUniverseInfo(universe, devices);
             DrawGizmoText(universePosition, universeInfo, GetUniverseColor(universe));
+            
+            i++;
         }
     }
     
-    private string GetUniverseInfo(UniverseDevices universe)
+    private string GetUniverseInfo(int universe, List<IDMXDevice> devices)
     {
-        int deviceCount = universe.devices?.Length ?? 0;
-        int channelCount = GetUniverseChannelCount(universe);
+        int deviceCount = devices.Count;
+        int channelCount = GetUsedChannelsInUniverse(universe);
         
-        return $"Universe {universe.universe}: {deviceCount} devices, {channelCount}/512 channels";
+        return $"Universe {universe}: {deviceCount} devices, {channelCount}/512 channels";
     }
     
-    private int GetUniverseChannelCount(UniverseDevices universe)
+    private Color GetUniverseColor(int universe)
     {
-        if (universe.devices == null) return 0;
-        
-        int maxChannel = 0;
-        foreach (var device in universe.devices)
-        {
-            if (device != null)
-            {
-                maxChannel = Mathf.Max(maxChannel, device.StartChannel + device.NumChannels);
-            }
-        }
-        return maxChannel;
-    }
-    
-    private Color GetUniverseColor(UniverseDevices universe)
-    {
-        int channelCount = GetUniverseChannelCount(universe);
+        int channelCount = GetUsedChannelsInUniverse(universe);
         
         if (channelCount == 0) return Color.gray;
         if (channelCount > 512) return Color.red;
@@ -552,4 +685,6 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         });
         #endif
     }
+    
+    #endregion
 }
