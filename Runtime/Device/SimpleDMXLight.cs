@@ -3,42 +3,12 @@
 [RequireComponent(typeof(Light))]
 public class SimpleDMXLight : DMXDevice
 {
-    [Header("DMX Placement")]
-    [SerializeField] private bool useCustomPlacement = false;
-    [SerializeField] private int customUniverse = 0;
-    [SerializeField] private int customStartChannel = 0;
-    [SerializeField] private bool allowAutoReassign = true;
-    [SerializeField] private int devicePriority = 0;
-    
     [Header("Light Configuration")]
     public Light targetLight;
     
     private Color lastColor;
     
     public override int NumChannels { get { return 4; } }
-    
-    public override DMXPlacement GetPreferredPlacement()
-    {
-        if (useCustomPlacement && customStartChannel > 0)
-        {
-            return DMXPlacement.Manual(customUniverse, customStartChannel, allowAutoReassign, devicePriority);
-        }
-        
-        // Default auto-assignment
-        return DMXPlacement.Auto;
-    }
-    
-    public override void OnPlacementAssigned(int universe, int startChannel)
-    {
-        base.OnPlacementAssigned(universe, startChannel);
-        
-        // Update custom placement fields to reflect actual assignment
-        if (!useCustomPlacement)
-        {
-            customUniverse = universe;
-            customStartChannel = startChannel;
-        }
-    }
     
     protected override void Start()
     {
@@ -93,7 +63,9 @@ public class SimpleDMXLight : DMXDevice
         // Check if color has changed
         if (Vector4.Distance(currentColor, lastColor) < 0.01f)
             return false;
+        
         Debug.Log(currentColor);
+        
         // Update output DMX data from light
         outputData[0] = (byte)(currentColor.r * 255);
         outputData[1] = (byte)(currentColor.g * 255);
@@ -106,8 +78,6 @@ public class SimpleDMXLight : DMXDevice
         
         return true;
     }
-    
-    // ... rest of the methods remain the same
     
     protected override void DrawChannelValues(Vector3 basePosition)
     {

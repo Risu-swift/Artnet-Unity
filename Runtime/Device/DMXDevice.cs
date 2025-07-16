@@ -5,14 +5,9 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
     #region Serialized Fields
     
     [Header("DMX Configuration")]
-    [SerializeField] protected int startChannel = 0;
+    [SerializeField] protected int universe = 0;
+    [SerializeField] protected int startChannel = 1;
     [SerializeField] protected DMXDeviceMode deviceMode = DMXDeviceMode.Input;
-    
-    [Header("Placement Preferences")]
-    [SerializeField] protected int preferredUniverse = 0;
-    [SerializeField] protected int preferredStartChannel = 0;
-    [SerializeField] protected bool allowAutoAssign = true;
-    [SerializeField] protected int placementPriority = 0;
     
     [Header("Output Configuration")]
     [SerializeField] protected bool autoUpdate = true;
@@ -35,7 +30,6 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
     protected byte[] outputData;
     protected IDMXCommunicator communicator;
     protected float lastUpdateTime;
-    protected int assignedUniverse = 0;
     
     #endregion
     
@@ -43,33 +37,8 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
     
     public abstract int NumChannels { get; }
     public int StartChannel { get => startChannel; set => startChannel = value; }
+    public int Universe { get => universe; set => universe = value; }
     public DMXDeviceMode DeviceMode => deviceMode;
-    
-    public virtual DMXPlacement GetPreferredPlacement()
-    {
-        return new DMXPlacement
-        {
-            universe = preferredUniverse,
-            startChannel = preferredStartChannel,
-            autoAssign = allowAutoAssign,
-            priority = placementPriority
-        };
-    }
-    
-    public virtual void OnPlacementAssigned(int universe, int startChannel)
-    {
-        assignedUniverse = universe;
-        this.startChannel = startChannel;
-        
-        Debug.Log($"Device {GetOriginalName()} assigned to Universe {universe}, Channel {startChannel}-{startChannel + NumChannels - 1}");
-        
-        #if UNITY_EDITOR
-        if (Application.isPlaying)
-        {
-            UnityEditor.EditorUtility.SetDirty(this);
-        }
-        #endif
-    }
     
     public byte[] GetInputData() => inputData;
     public byte[] GetOutputData() => outputData;
@@ -180,12 +149,10 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
         }
     }
     
-    public int GetAssignedUniverse() => assignedUniverse;
-    
     public string GetChannelInfo()
     {
         return startChannel > 0 ? 
-            $"U{assignedUniverse}:Ch{startChannel}-{startChannel + NumChannels - 1}" : 
+            $"U{universe}:Ch{startChannel}-{startChannel + NumChannels - 1}" : 
             "Not Assigned";
     }
     
@@ -201,7 +168,7 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
     {
         if (communicator is DmxController controller)
         {
-            controller.UpdateDeviceName(this, assignedUniverse, startChannel);
+            controller.UpdateDeviceName(this, universe, startChannel);
         }
     }
     

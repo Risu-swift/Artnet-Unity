@@ -1,30 +1,13 @@
 ﻿using UnityEngine;
 using System.Collections.Generic;
 
-// Device placement preferences - devices can specify where they want to be
-[System.Serializable]
-public struct DMXPlacement
-{
-    public int universe;
-    public int startChannel;
-    public bool autoAssign;         // Let controller auto-assign if preferred location is taken
-    public int priority;            // Higher priority devices get preference in conflicts
-    
-    public static DMXPlacement Auto => new DMXPlacement { universe = 0, startChannel = 0, autoAssign = true, priority = 0 };
-    public static DMXPlacement Manual(int universe, int startChannel, bool autoAssign = false, int priority = 0) => 
-        new DMXPlacement { universe = universe, startChannel = startChannel, autoAssign = autoAssign, priority = priority };
-}
-
-// Core DMX device interface - updated with placement preferences
+// Core DMX device interface - simplified to only require specific universe and channel
 public interface IDMXDevice
 {
     int NumChannels { get; }
     int StartChannel { get; set; }
+    int Universe { get; set; }
     DMXDeviceMode DeviceMode { get; }
-    
-    // Device tells controller where it wants to be placed
-    DMXPlacement GetPreferredPlacement();
-    void OnPlacementAssigned(int universe, int startChannel);
     
     // Separate methods for input and output data
     byte[] GetInputData();
@@ -38,10 +21,6 @@ public interface IDMXCommunicator
     void SendData(IDMXDevice device);
     void RegisterDevice(IDMXDevice device);
     void UnregisterDevice(IDMXDevice device);
-    
-    // New method for device placement queries
-    bool IsPlacementAvailable(int universe, int startChannel, int numChannels);
-    DMXPlacement SuggestPlacement(IDMXDevice device);
 }
 
 // Simple device factory - just for auto-discovery

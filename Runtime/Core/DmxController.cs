@@ -22,10 +22,6 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     public bool enableBatching = true;
     public int maxUniverses = 16;
     
-    [Header("Auto Discovery")]
-    public bool autoDiscoverDevices = true;
-    public bool discoverOnStart = true;
-    
     [Header("Debug")]
     public bool showDebugLogs = false;
     
@@ -57,12 +53,6 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         dmxPacket.DmxData = new byte[512];
         
         LogDebug($"DMX Controller initialized - Batching: {enableBatching}, Send Rate: {sendRate}Hz");
-        
-        // Discover devices automatically if enabled
-        if (discoverOnStart)
-        {
-            DiscoverDevices();
-        }
     }
     
     void Update()
@@ -89,43 +79,89 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     {
         if (device == null) return;
         
+        int universe = device.Universe;
+        int startChannel = device.StartChannel;
+        
+        // Validate universe and channel
+        if (universe < 0 || universe >= maxUniverses)
+        {
+            Debug.LogError($"Device '{device}' has invalid universe {universe}. Must be between 0 and {maxUniverses - 1}.");
+            return;
+        }
+        
+        if (startChannel <= 0 || startChannel > 512)
+        {
+            Debug.LogError($"Device '{device}' has invalid start channel {startChannel}. Must be between 1 and 512.");
+            return;
+        }
+        
+        if (startChannel + device.NumChannels - 1 > 512)
+        {
+            Debug.LogError($"Device '{device}' channels ({startChannel} to {startChannel + device.NumChannels - 1}) exceed universe limit of 512.");
+            return;
+        }
+        
+        // Check for channel conflicts
+        if (HasChannelConflict(universe, startChannel, device.NumChannels, device))
+        {
+            Debug.LogError($"Device '{device}' has channel conflict in universe {universe} at channel {startChannel}.");
+            return;
+        }
+        
         // Store original name if we haven't already
         if (device is DMXDevice dmxDevice)
         {
             dmxDevice.StoreOriginalName();
         }
         
-        // Ask device where it wants to be placed
-        var preferredPlacement = device.GetPreferredPlacement();
-        var actualPlacement = ProcessPlacementRequest(device, preferredPlacement);
-        
-        // Assign the device to its placement
-        device.OnPlacementAssigned(actualPlacement.universe, actualPlacement.startChannel);
-        
-        // Update GameObject name if enabled
+        // Update GameObject name
         if (device is DMXDevice dmxDev)
         {
-            UpdateDeviceName(dmxDev, actualPlacement.universe, actualPlacement.startChannel);
+            UpdateDeviceName(dmxDev, universe, startChannel);
         }
         
         // Add to universe tracking
-        if (!devicesByUniverse.ContainsKey(actualPlacement.universe))
+        if (!devicesByUniverse.ContainsKey(universe))
         {
-            devicesByUniverse[actualPlacement.universe] = new List<IDMXDevice>();
-            universeBuffers[actualPlacement.universe] = new byte[512];
-            universeDirty[actualPlacement.universe] = false;
+            devicesByUniverse[universe] = new List<IDMXDevice>();
+            universeBuffers[universe] = new byte[512];
+            universeDirty[universe] = false;
         }
         
-        if (!devicesByUniverse[actualPlacement.universe].Contains(device))
+        if (!devicesByUniverse[universe].Contains(device))
         {
-            devicesByUniverse[actualPlacement.universe].Add(device);
-            LogDebug($"Registered device '{device}' to Universe {actualPlacement.universe}, channels {actualPlacement.startChannel}-{actualPlacement.startChannel + device.NumChannels - 1}");
+            devicesByUniverse[universe].Add(device);
+            LogDebug($"Registered device '{device}' to Universe {universe}, channels {startChannel}-{startChannel + device.NumChannels - 1}");
             
             OnDeviceRegistered?.Invoke(device);
         }
     }
     
-public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
+    private bool HasChannelConflict(int universe, int startChannel, int numChannels, IDMXDevice excludeDevice)
+    {
+        if (!devicesByUniverse.ContainsKey(universe))
+            return false;
+        
+        int endChannel = startChannel + numChannels - 1;
+        
+        foreach (var existingDevice in devicesByUniverse[universe])
+        {
+            if (existingDevice == excludeDevice) continue;
+            
+            int existingStart = existingDevice.StartChannel;
+            int existingEnd = existingStart + existingDevice.NumChannels - 1;
+            
+            // Check for overlap
+            if (!(endChannel < existingStart || startChannel > existingEnd))
+            {
+                return true; // Overlap detected
+            }
+        }
+        
+        return false;
+    }
+    
+    public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
     {
         if (device == null) return;
         
@@ -169,164 +205,6 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
         OnDeviceUnregistered?.Invoke(device);
     }
     
-    private DMXPlacement ProcessPlacementRequest(IDMXDevice device, DMXPlacement preferred)
-    {
-        // Check if preferred placement is available
-        if (preferred.startChannel > 0 && IsPlacementAvailable(preferred.universe, preferred.startChannel, device.NumChannels))
-        {
-            LogDebug($"Device '{device}' got preferred placement: Universe {preferred.universe}, Channel {preferred.startChannel}");
-            return preferred;
-        }
-        
-        // If preferred placement is not available, check if device allows auto-assignment
-        if (preferred.autoAssign)
-        {
-            var suggested = SuggestPlacement(device);
-            LogDebug($"Device '{device}' auto-assigned to: Universe {suggested.universe}, Channel {suggested.startChannel}");
-            return suggested;
-        }
-        
-        // If no auto-assignment allowed, try to resolve conflict based on priority
-        var resolved = ResolveConflict(device, preferred);
-        if (resolved.startChannel > 0)
-        {
-            LogDebug($"Device '{device}' placement conflict resolved: Universe {resolved.universe}, Channel {resolved.startChannel}");
-            return resolved;
-        }
-        
-        // Fallback to auto-assignment
-        Debug.LogWarning($"Device '{device}' placement failed, falling back to auto-assignment");
-        return SuggestPlacement(device);
-    }
-    
-    public bool IsPlacementAvailable(int universe, int startChannel, int numChannels)
-    {
-        if (startChannel <= 0 || startChannel + numChannels - 1 > 512)
-            return false;
-        
-        if (!devicesByUniverse.ContainsKey(universe))
-            return true;
-        
-        // Check for conflicts with existing devices
-        foreach (var existingDevice in devicesByUniverse[universe])
-        {
-            int existingStart = existingDevice.StartChannel;
-            int existingEnd = existingStart + existingDevice.NumChannels - 1;
-            int requestedEnd = startChannel + numChannels - 1;
-            
-            // Check for overlap
-            if (!(requestedEnd < existingStart || startChannel > existingEnd))
-            {
-                return false; // Overlap detected
-            }
-        }
-        
-        return true;
-    }
-    
-    public DMXPlacement SuggestPlacement(IDMXDevice device)
-    {
-        int requiredChannels = device.NumChannels;
-        
-        // Try to find space in existing universes first
-        foreach (var kvp in devicesByUniverse.OrderBy(x => x.Key))
-        {
-            int universe = kvp.Key;
-            var suggestion = FindAvailableChannels(universe, requiredChannels);
-            if (suggestion.startChannel > 0)
-            {
-                return DMXPlacement.Manual(universe, suggestion.startChannel, true);
-            }
-        }
-        
-        // Create new universe if needed
-        int newUniverse = GetNextAvailableUniverse();
-        return DMXPlacement.Manual(newUniverse, 1, true);
-    }
-    
-    private DMXPlacement FindAvailableChannels(int universe, int requiredChannels)
-    {
-        if (!devicesByUniverse.ContainsKey(universe))
-        {
-            return DMXPlacement.Manual(universe, 1, true);
-        }
-        
-        // Get all occupied ranges and sort them
-        var occupiedRanges = devicesByUniverse[universe]
-            .Select(d => new { Start = d.StartChannel, End = d.StartChannel + d.NumChannels - 1 })
-            .OrderBy(r => r.Start)
-            .ToList();
-        
-        // Find first available gap
-        int nextAvailable = 1;
-        foreach (var range in occupiedRanges)
-        {
-            if (nextAvailable + requiredChannels - 1 < range.Start)
-            {
-                return DMXPlacement.Manual(universe, nextAvailable, true);
-            }
-            nextAvailable = range.End + 1;
-        }
-        
-        // Check if there's space at the end
-        if (nextAvailable + requiredChannels - 1 <= 512)
-        {
-            return DMXPlacement.Manual(universe, nextAvailable, true);
-        }
-        
-        return DMXPlacement.Manual(universe, 0, true); // No space found
-    }
-    
-    private DMXPlacement ResolveConflict(IDMXDevice newDevice, DMXPlacement preferred)
-    {
-        if (!devicesByUniverse.ContainsKey(preferred.universe))
-            return preferred;
-        
-        // Find conflicting devices
-        var conflictingDevices = devicesByUniverse[preferred.universe]
-            .Where(d => {
-                int existingStart = d.StartChannel;
-                int existingEnd = existingStart + d.NumChannels - 1;
-                int requestedEnd = preferred.startChannel + newDevice.NumChannels - 1;
-                return !(requestedEnd < existingStart || preferred.startChannel > existingEnd);
-            })
-            .ToList();
-        
-        // Check if new device has higher priority than all conflicting devices
-        foreach (var conflictingDevice in conflictingDevices)
-        {
-            if (conflictingDevice is DMXDevice dmxDevice)
-            {
-                var conflictingPlacement = dmxDevice.GetPreferredPlacement();
-                if (conflictingPlacement.priority >= preferred.priority)
-                {
-                    return DMXPlacement.Manual(preferred.universe, 0, true); // Conflict not resolved
-                }
-            }
-        }
-        
-        // Move conflicting devices if new device has higher priority
-        foreach (var conflictingDevice in conflictingDevices)
-        {
-            UnregisterDevice(conflictingDevice);
-            RegisterDevice(conflictingDevice); // Will trigger re-assignment
-        }
-        
-        return preferred;
-    }
-    
-    private int GetNextAvailableUniverse()
-    {
-        for (int i = 0; i < maxUniverses; i++)
-        {
-            if (!devicesByUniverse.ContainsKey(i))
-            {
-                return i;
-            }
-        }
-        return maxUniverses - 1; // Fallback
-    }
-    
     #endregion
     
     #region Data Transmission
@@ -335,7 +213,7 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
     {
         if (device?.GetOutputData() == null) return;
         
-        int universe = GetDeviceUniverse(device);
+        int universe = device.Universe;
         
         if (!universeBuffers.ContainsKey(universe))
         {
@@ -345,7 +223,7 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
         
         // Copy device data to universe buffer
         var outputData = device.GetOutputData();
-        int startIndex = (device.StartChannel - 1) % 512; // Handle multi-universe scenarios
+        int startIndex = device.StartChannel - 1; // Convert to 0-based index
         
         for (int i = 0; i < outputData.Length && (startIndex + i) < 512; i++)
         {
@@ -447,7 +325,7 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
             {
                 if (device.DeviceMode == DMXDeviceMode.Input || device.DeviceMode == DMXDeviceMode.Bidirectional)
                 {
-                    int startIndex = (device.StartChannel - 1) % 512;
+                    int startIndex = device.StartChannel - 1; // Convert to 0-based index
                     if (startIndex >= 0 && startIndex < data.Length)
                     {
                         int length = Mathf.Min(device.NumChannels, data.Length - startIndex);
@@ -464,49 +342,7 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
     
     #endregion
     
-    #region Device Discovery
-    
-    [ContextMenu("Discover Devices")]
-    public void DiscoverDevices()
-    {
-        if (!autoDiscoverDevices)
-            return;
-        
-        LogDebug("Discovering DMX devices in scene...");
-        
-        var discoveredDevices = DMXDeviceDiscovery.DiscoverDevices();
-        
-        foreach (var device in discoveredDevices)
-        {
-            RegisterDevice(device);
-        }
-        
-        LogDebug($"Discovered and registered {discoveredDevices.Count} DMX devices");
-    }
-    
-    #endregion
-    
     #region Utility Methods
-    
-    private int GetDeviceUniverse(IDMXDevice device)
-    {
-        // Find which universe the device is currently in
-        foreach (var kvp in devicesByUniverse)
-        {
-            if (kvp.Value.Contains(device))
-            {
-                return kvp.Key;
-            }
-        }
-        
-        // Fallback: calculate based on channel number
-        if (device.StartChannel > 0)
-        {
-            return (device.StartChannel - 1) / 512;
-        }
-        
-        return 0;
-    }
     
     private void LogDebug(string message)
     {
@@ -530,7 +366,7 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
             
             foreach (var device in kvp.Value)
             {
-                Debug.Log($"  - {device} (Ch {device.StartChannel}-{device.StartChannel + device.NumChannels - 1}, Mode: {device.DeviceMode})");
+                Debug.Log($"  - {device} (U{device.Universe}:Ch{device.StartChannel}-{device.StartChannel + device.NumChannels - 1}, Mode: {device.DeviceMode})");
             }
         }
     }
@@ -554,18 +390,6 @@ public void UpdateDeviceName(DMXDevice device, int universe, int startChannel)
         }
         
         Debug.Log("Cleared all registered devices");
-    }
-    
-    public void SetDeviceUniverse(IDMXDevice device, int universe, int startChannel = -1)
-    {
-        UnregisterDevice(device);
-        
-        if (startChannel > 0)
-        {
-            device.StartChannel = startChannel;
-        }
-        
-        RegisterDevice(device);
     }
     
     private int GetUsedChannelsInUniverse(int universe)
