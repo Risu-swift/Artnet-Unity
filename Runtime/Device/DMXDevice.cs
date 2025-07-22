@@ -7,7 +7,7 @@ public abstract class DMXDevice : MonoBehaviour, IDMXDevice
     [Header("DMX Configuration")]
     [SerializeField] protected int universe = 0;
     [SerializeField] protected int startChannel = 1;
-    [SerializeField] protected DMXDeviceMode deviceMode = DMXDeviceMode.Input;
+    [SerializeField] public DMXDeviceMode deviceMode = DMXDeviceMode.Input;
     
     [Header("Output Configuration")]
     [SerializeField] protected bool autoUpdate = true;
