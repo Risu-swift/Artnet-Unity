@@ -16,7 +16,7 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     public int customPort = 6454;
     public bool isServer = true;
     public string deviceNameFormat = "{originalName} [U{universe}:Ch{startChannel}-{endChannel}]";
-
+    public bool connectOnAwake = true;
     [Header("Performance Settings")]
     public float sendRate = 30f;
     public bool enableBatching = true;
@@ -29,6 +29,7 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     private ArtNetSocket artnet;
     private IPEndPoint remote;
     private ArtNetDmxPacket dmxPacket;
+    private bool isInitalized = false;
     
     // Device management
     private Dictionary<int, List<IDMXDevice>> devicesByUniverse = new Dictionary<int, List<IDMXDevice>>();
@@ -45,18 +46,25 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
     public System.Action<IDMXDevice> OnDeviceUnregistered;
     
     #region Unity Lifecycle
-    
+
     void Start()
+    {
+        if(connectOnAwake)
+            Init();
+    }
+    void Init()
     {
         InitializeArtNet();
         dmxPacket = new ArtNetDmxPacket();
         dmxPacket.DmxData = new byte[512];
         
         LogDebug($"DMX Controller initialized - Batching: {enableBatching}, Send Rate: {sendRate}Hz");
+        isInitalized = true;
     }
     
     void Update()
     {
+        if(!isInitalized) return;
         ProcessIncomingData();
         
         if (enableBatching && Time.time - lastSendTime >= 1f / sendRate)
