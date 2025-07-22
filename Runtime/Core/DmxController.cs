@@ -52,7 +52,7 @@ public class DmxController : MonoBehaviour, IDMXCommunicator
         if(connectOnAwake)
             Init();
     }
-    void Init()
+    public void Init()
     {
         InitializeArtNet();
         dmxPacket = new ArtNetDmxPacket();
